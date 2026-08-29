@@ -13,6 +13,13 @@ https://github.com/basecamp/omarchy.git`, with `.git/` stripped afterwards.
   `4.0.1-1`. This is not a reconstruction — it's the exact tree this laptop
   is running.
 
+**Why this repo is ~120MB**: `pacman -Qi omarchy` on the live machine
+reports the package's own `Installed Size` as 120.91 MiB — this vendored
+copy (132M on disk, 119MB of git-packed objects) matches that almost
+exactly. `themes/` (22 built-in themes, each with its own wallpaper image)
+accounts for 119 of the 132MB. This isn't something we added — it's
+genuinely how big upstream Omarchy is.
+
 This is the *entire* upstream repo: `bin/` (430 `omarchy-*` helper scripts),
 `default/` (Hyprland Lua config, shell env, fonts, plymouth/sddm themes,
 per-app config for every terminal/editor Omarchy themes), `shell/` (the
