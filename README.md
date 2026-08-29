@@ -87,6 +87,13 @@ flake.nix           Wires it all together
 
 ## First boot on the test laptop
 
+**Deploying this on an agent's behalf?** Hand it `AGENT_ONBOARDING.md`
+first — it has the hard safety rules (don't touch partitions, always
+regenerate `hardware-configuration.nix` from the real machine, `build`
+before `switch`, match the existing bootloader, know the rollback path
+before switching) plus the full procedure. The steps below are the short
+version for a human doing it by hand.
+
 ```bash
 git clone git@github.com:ziyadev/nixos-config.git
 cd nixos-config
