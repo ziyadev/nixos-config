@@ -9,7 +9,18 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    hyprland.url = "github:hyprwm/Hyprland";
+    # Pinned to the exact commit this laptop's Omarchy install reports
+    # (`hyprctl version` → 0.56.2, commit efb50993...), so hyprland.lua's
+    # native Lua config support matches upstream behavior exactly.
+    hyprland = {
+      url = "github:hyprwm/Hyprland/efb50993780079460b0cbed1363e2166a2de1d9f";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    quickshell = {
+      url = "github:quickshell-mirror/quickshell";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = { self, nixpkgs, home-manager, hyprland, ... }@inputs:
@@ -34,6 +45,7 @@
         inherit system;
         specialArgs = { inherit inputs; };
         modules = [
+          ./modules/omarchy.nix
           ./hosts/laptop/configuration.nix
           home-manager.nixosModules.home-manager
           {

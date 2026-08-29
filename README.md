@@ -1,112 +1,132 @@
 # nixos-config
 
-Dotfiles/config exported from an [Omarchy](https://omarchy.org) machine
-(Arch Linux + Hyprland + Omarchy's QML shell), for testing on a NixOS
-laptop via home-manager.
+A full attempt at reproducing this laptop's [Omarchy](https://omarchy.org)
+desktop (Arch Linux + Hyprland + Omarchy's Quickshell-based shell) on
+NixOS, for testing on a second laptop.
 
-This is a **starting point, not a finished NixOS setup**. Omarchy is a
-whole opinionated Arch-based distro (its own installer, pacman hooks, a
-custom QML desktop shell/bar, Lua-based Hyprland bootstrapping) — none of
-that infrastructure exists on NixOS. What's vendored here is your actual
-personal config/override files, copied as-is, so you have something
-concrete to diff against and adapt rather than starting from a blank
-`~/.config`.
+**Status: written, not build-tested.** There is no `nix` binary on this
+(Arch) machine to run `nix flake check` against, so treat this as a strong
+first draft to `nixos-rebuild build` against on the real target and fix
+forward — not a guarantee every package name and option below is exactly
+right. Where I was genuinely unsure of a nixpkgs name, it's flagged inline
+with a comment.
 
-## What's in here
+## What "everything" means here
+
+Rather than a hand-picked subset, `vendor/omarchy` is a **verbatim clone of
+upstream `basecamp/omarchy` at tag `v4.0.1`** — the exact version this
+machine runs (`diff -rq` against the live `/usr/share/omarchy` comes back
+clean). That's all 430 `omarchy-*` helper scripts, the full Quickshell
+QML shell (bar, app menu, launcher, lock screen, notifications — the thing
+that opens on `SUPER+SPACE`), every Hyprland Lua binding, all 22 built-in
+themes, fonts, the sddm/plymouth boot theme, and the canonical package
+list. See `vendor/VENDOR.md` for exactly how it was pulled and how to
+refresh it later. Nothing was selectively copied or summarized — if it's
+in upstream Omarchy 4.0.1, it's in this repo.
+
+On top of that, `config/` still holds your personal `~/.config` overrides
+from the previous pass (hypr bindings/monitors/input overrides, terminal
+configs, nvim, tmux, git, starship, etc.) — see the bottom of this file for
+what's excluded there and why (a live GitHub token, one machine-specific
+file).
+
+## Repo layout
 
 ```
-config/            Raw copy of ~/.config/* from the Omarchy machine
-  hypr/             Your Hyprland overrides (Lua) — see caveat below
-  omarchy/          Omarchy shell config: branding, hooks, themes, plugins,
-                     shell.json (bar layout/theme). Excludes tableau.toml
-                     (hardcoded /usr/lib/chromium paths + a public Chromium
-                     OAuth placeholder — not portable, not worth carrying).
-  alacritty/ foot/ kitty/ ghostty/   Terminal emulator configs
-  nvim/             Full Neovim config (LazyVim-based)
-  tmux/ btop/ lazygit/ starship.toml mise/
-  git/              gitconfig + git ignore (uses `gh auth git-credential`)
-  fcitx5/           Input method config
-  nwg-displays/ gtk-3.0/ autostart/ mimeapps.list
-
-home-manager/
-  home.nix          home-manager module that symlinks config/* into place
-                     via xdg.configFile, plus a package list mirroring what
-                     was installed on the Arch box
-
-hosts/laptop/
-  configuration.nix        Placeholder NixOS system config (Hyprland,
-                            networking, fcitx5, pipewire, a `ziyadev` user)
-  hardware-configuration.nix   PLACEHOLDER — regenerate per-machine, see below
-
-flake.nix           Wires the above together
+vendor/omarchy/     Verbatim upstream Omarchy v4.0.1 source (see VENDOR.md)
+config/             Your personal ~/.config overrides (previous pass)
+modules/omarchy.nix NixOS module: wires vendor/omarchy into a real system
+home-manager/home.nix   Symlinks config/* into place, user packages
+hosts/laptop/       Placeholder host config — hostname, disks, bootloader
+flake.nix           Wires it all together
 ```
 
-**Deliberately left out:** `~/.config/gh/hosts.yml` (contains a live GitHub
-OAuth token), `~/.config/omarchy/tableau.toml` (machine-specific paths +
-the aforementioned OAuth string), and app data / caches / profiles for
-Chromium, Google Chrome, Obsidian, Bitwarden (large, and personal data, not
-config).
+## How `modules/omarchy.nix` actually reproduces Omarchy
 
-The QML plugins under `config/omarchy/plugins/*` are third-party
-(`io.github.maxart.simple-workspaces`, `m1kode.obsidian-tasks`,
-`novuon.tableau`, `propsuite.dell-input`) — vendored here as plain files
-(their nested `.git` dirs were stripped) purely for reference. They belong
-to their own upstream repos/licenses.
+- **`vendor/omarchy` → `/usr/share/omarchy`.** A handful of vendored
+  scripts hardcode `/usr/share/omarchy` instead of going through
+  `$OMARCHY_PATH` (e.g. the uwsm env.d file that sources
+  `default/bash/env-bootstrap`). NixOS doesn't populate `/usr`, but `/` is
+  a normal writable filesystem, so a `system.activationScripts` symlink
+  recreates that path deliberately, rather than patching 430 scripts.
+  `OMARCHY_PATH` is also set explicitly for everything that does the right
+  thing and reads the env var.
+- **Hyprland is built from `github:hyprwm/Hyprland` pinned to the exact
+  commit this laptop reports** (`hyprctl version`), not nixpkgs' own
+  hyprland package — because `hyprland.lua`'s `dofile()`/Lua config
+  loading needs to match upstream's Lua support precisely.
+- **Quickshell** comes from its own flake (`quickshell-mirror/quickshell`),
+  which is what actually renders Omarchy's bar/menu/launcher —
+  `default/hypr/autostart.lua` execs `omarchy-launch-shell`, which runs
+  `quickshell -p $OMARCHY_PATH/shell`.
+- **uwsm** launches Hyprland the same way Omarchy's own session file does
+  (`uwsm start -g -1 -e -D Hyprland hyprland.desktop`), via NixOS's
+  `programs.uwsm.waylandCompositors`.
+- **sddm + plymouth** use Omarchy's actual theme assets, packaged from the
+  vendored `default/sddm/omarchy` and `default/plymouth`.
+- **The package list** is `install/omarchy-base.packages` (Omarchy's own
+  canonical Arch package manifest — not something I compiled by hand)
+  translated to nixpkgs names package-by-package. Deliberately **not**
+  included:
+  - `install/omarchy-other.packages` — hardware-specific drivers (Nvidia,
+    Asus, Framework, T2 Mac, Surface, Broadcom Wi-Fi, various DKMS
+    modules). Pick from there based on the *actual* hardware of the laptop
+    you're testing on, after `nixos-generate-config` tells you what it has.
+  - Arch-only tooling with no NixOS meaning: `pacman-contrib`, `expac`,
+    `kernel-modules-hook`, `yay` (AUR helper), `limine`/`limine-snapper-sync`
+    (NixOS's own generation rollback replaces the Btrfs-snapshot boot menu
+    entirely — see the comment in `hosts/laptop/configuration.nix`).
+  - Omarchy's own closed-source-to-nixpkgs custom tools with no package
+    upstream: `aether`, `cliamp`, `herdr`, `omacalc`, `omacut`, `omawrite`,
+    `tensaku`, `tobi-try`, `ttfx`, `usage`. If you rely on any of these
+    day-to-day, they'd need to be packaged separately (many are on AUR —
+    check if they're just source-available and buildable as a plain Nix
+    derivation).
+  - `omarchy-nvim` — not needed; your actual nvim config is already
+    vendored verbatim in `config/nvim`.
 
-## The big caveat: Hyprland config is Lua, and expects Omarchy
-
-`config/hypr/hyprland.lua` does this:
-
-```lua
-dofile((os.getenv("OMARCHY_PATH") or "/usr/share/omarchy") .. "/default/hypr/bootstrap.lua")
-...
-require("default.hypr.omarchy")
-```
-
-That pulls in Omarchy's own defaults from `/usr/share/omarchy`, which only
-exists on an Omarchy install. On NixOS this file will fail to load as-is.
-Your actual personal overrides — the parts you'd care about porting — are:
-
-- `hypr/monitors.lua` / `monitors.conf`
-- `hypr/input.lua`
-- `hypr/bindings.lua`
-- `hypr/looknfeel.lua`
-- `hypr/autostart.lua`
-
-Two realistic paths forward, worth trying on the test laptop:
-
-1. **Vendor Omarchy's Lua defaults too.** Omarchy is open source
-   (github.com/basecamp/omarchy) — you could pull `default/hypr/*.lua` from
-   its repo into this one and package `hyprland-lua` (whatever Hyprland
-   config-lang plugin Omarchy relies on) as a Nix derivation. More
-   faithful, more work.
-2. **Rewrite as plain `hyprland.conf`.** Translate the handful of lines in
-   the five files above into standard Hyprland config syntax and drop the
-   `dofile`/`require` scaffolding entirely. Loses Omarchy's shared defaults
-   but is the path of least resistance on NixOS, and `programs.hyprland` in
-   `hosts/laptop/configuration.nix` expects this.
-
-Either way, the *bar/shell* (`omarchy/shell.json` + the QML plugins) is
-Omarchy-specific UI you'd need to replace with something NixOS-native
-(waybar, ags/astal, quickshell, etc.) — the JSON/QML here is reference
-material for recreating the same layout/behavior, not a drop-in.
-
-## Trying it on the other laptop
+## First boot on the test laptop
 
 ```bash
 git clone git@github.com:ziyadev/nixos-config.git
 cd nixos-config
 
-# 1. Get real hardware info for that machine (overwrites the placeholder):
-sudo nixos-generate-config --dir ./hosts/laptop
+sudo nixos-generate-config --dir ./hosts/laptop   # real hardware-configuration.nix
+# edit hosts/laptop/configuration.nix: hostname, timezone, add any
+# hardware-specific packages from vendor/omarchy/install/omarchy-other.packages
 
-# 2a. Just the dotfiles, on an existing NixOS install with home-manager:
-home-manager switch --flake .#ziyadev
-
-# 2b. Or a full system switch (edit hosts/laptop/configuration.nix first —
-#     hostname, timezone, disks/bootloader assumptions):
+sudo nixos-rebuild build --flake .#laptop   # build without switching first — see what breaks
 sudo nixos-rebuild switch --flake .#laptop
 ```
 
-Expect to iterate — this repo captures where you started from, not a
-tested end state.
+After first login, regenerate the active-theme state (the terminal configs
+in `config/` all `include`/`import` `~/.local/state/omarchy/current/theme/*`
+for colors — that directory is *generated*, not something to copy from the
+old machine, since it also contains an absolute-path symlink):
+
+```bash
+omarchy-theme-set vantablack   # or: omarchy-theme-list, to see all 22
+```
+
+Expect to iterate from here — this is a from-scratch NixOS reproduction of
+a fast-moving, Arch-native distro, not a tested end state. Report back
+whatever breaks first (most likely candidates: a mistranslated package
+name in `modules/omarchy.nix`, or a `bin/omarchy-*` script that shells out
+to something Arch-specific like `pacman` or `systemctl` against a service
+NixOS names differently) and it's straightforward to fix forward from
+there.
+
+## The `config/` overrides (previous pass)
+
+Your personal `~/.config` overrides, symlinked into place by
+`home-manager/home.nix`. **Deliberately excluded:** `~/.config/gh/hosts.yml`
+(a live GitHub OAuth token) and `~/.config/omarchy/tableau.toml`
+(hardcoded `/usr/lib/chromium` paths from this machine, not portable). Also
+excluded: Chromium/Google Chrome/Obsidian/Bitwarden app data — personal
+data and caches, not config.
+
+The QML plugins under `config/omarchy/plugins/*` are third-party
+(`io.github.maxart.simple-workspaces`, `m1kode.obsidian-tasks`,
+`novuon.tableau`, `propsuite.dell-input`) — vendored as plain files (their
+nested `.git` dirs stripped) for reference; they belong to their own
+upstream repos/licenses.

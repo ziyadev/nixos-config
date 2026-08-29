@@ -1,5 +1,8 @@
 { config, pkgs, lib, inputs, ... }:
 
+# Host-specific settings only. The Omarchy desktop stack itself (Hyprland +
+# uwsm + Quickshell + sddm + fonts + the full omarchy-base.packages list) is
+# in ../../modules/omarchy.nix, imported by flake.nix alongside this file.
 {
   imports = [
     # Generate this on the target laptop with:
@@ -10,48 +13,32 @@
 
   networking.hostName = "laptop"; # change to whatever you want
 
-  # --- Bootloader ---------------------------------------------------------
+  # --- Bootloader -----------------------------------------------------
+  # Real Omarchy uses limine + limine-snapper-sync for boot-time Btrfs
+  # snapshot rollback. NixOS's own generations (visible in this same
+  # systemd-boot menu, roll back with `nixos-rebuild switch --rollback`)
+  # cover that use case natively — not worth reintroducing limine/snapper
+  # for it. Swap to boot.loader.grub if the target machine needs BIOS boot.
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;
 
-  # --- Networking -----------------------------------------------------
+  # --- Networking -------------------------------------------------------
   networking.networkmanager.enable = true;
+  networking.firewall.enable = true; # NixOS-native equivalent of ufw
 
-  # --- Time / locale ----------------------------------------------------
+  # --- Time / locale ------------------------------------------------------
   time.timeZone = "Etc/UTC"; # set to your real timezone
   i18n.defaultLocale = "en_US.UTF-8";
 
-  # --- Users --------------------------------------------------------------
+  # --- Users ----------------------------------------------------------
   users.users.ziyadev = {
     isNormalUser = true;
-    extraGroups = [ "wheel" "networkmanager" "video" "input" ];
+    extraGroups = [ "wheel" "networkmanager" "video" "input" "docker" ];
     shell = pkgs.zsh;
   };
   programs.zsh.enable = true;
 
-  # --- Hyprland -------------------------------------------------------
-  # Omarchy's shell/bar is its own QML-based desktop shell layered on top of
-  # Hyprland (see config/omarchy/shell.json + config/omarchy/plugins) and is
-  # not packaged for NixOS. This gives you vanilla Hyprland; the bar/theme
-  # layer needs to be replaced (waybar, ags, quickshell, etc.) or rebuilt.
-  programs.hyprland.enable = true;
-  xdg.portal.enable = true;
-  xdg.portal.extraPortals = [ pkgs.xdg-desktop-portal-hyprland ];
-
-  # --- Input method (fcitx5, mirrors config/fcitx5) -----------------------
-  i18n.inputMethod = {
-    enable = true;
-    type = "fcitx5";
-    fcitx5.addons = with pkgs; [ fcitx5-gtk ];
-  };
-
-  # --- Sound ------------------------------------------------------------
-  security.rtkit.enable = true;
-  services.pipewire = {
-    enable = true;
-    alsa.enable = true;
-    pulse.enable = true;
-  };
+  nixpkgs.config.allowUnfree = true; # chromium, obsidian, moonlight-qt, etc.
 
   system.stateVersion = "24.11";
 }
