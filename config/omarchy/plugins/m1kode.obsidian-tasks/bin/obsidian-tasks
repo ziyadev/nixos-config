@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""Read and edit Obsidian Tasks-format checkboxes in a vault.
+
+Kept deliberately small: the QML widget owns presentation, this owns every
+touch of the vault. Every write is a compare-and-swap on the exact line text
+rather than a line number, because Obsidian Sync can rewrite a file between
+the scan that drew a row and the click that acts on it.
+"""
+import errno
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from datetime import date, timedelta
+
+DUE, DONE, CREATED, SCHEDULED, START = "\U0001F4C5", "✅", "➕", "⏳", "\U0001F6EB"
+PRIORITY = {"\U0001F53A": 0, "\U000023EB": 1, "\U0001F53C": 2, "\U0001F53D": 4, "\U000023EC": 5}
+# Every signifier Obsidian Tasks defines, whether or not this tool reads it.
+# The list exists so a rename can find where the description ends and leave
+# metadata it doesn't understand untouched rather than eating it.
+SIGNIFIERS = [DUE, DONE, CREATED, SCHEDULED, START, "❌", "\U0001F501",
+              "\U0001F194", "⛔", "\U0001F6AB"] + list(PRIORITY)
+TASK_RE = re.compile(r"^(?P<indent>\s*)(?P<bullet>[-*+])\s\[(?P<status>.)\]\s(?P<body>.*)$")
+DATE_RE = r"(\d{4}-\d{2}-\d{2})"
+EXCLUDES = ["!.obsidian", "!.trash", "!Templates", "!.git"]
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+# A note is kilobytes. Past this a file is not a note any more, and reading it
+# was somebody else's idea rather than the user's.
+MAX_NOTE_BYTES = 4 * 1024 * 1024
+READ_CHUNK = 1 << 16
+O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+
+# ------------------------------------------------------------- safe file access
+
+# Paths reaching this tool come out of a scan of a folder the user pointed at,
+# and a folder can contain things that are not notes. A symlink would send an
+# edit somewhere else entirely, a FIFO would park the helper forever with the
+# widget waiting on it, and a very large file would be pulled into memory in
+# full. So nothing here opens a path and trusts what it gets: every open is by
+# descriptor, refuses to follow a final symlink, cannot block, and is checked
+# with fstat before a byte is read.
+
+class NotANote(OSError):
+    """The path is not a regular file this tool is willing to touch."""
+
+
+def split_target(path):
+    """(directory, filename) for a note, as separate pieces.
+
+    Kept apart because every operation works relative to an open directory
+    descriptor rather than re-walking the path each time.
+    """
+    directory, name = os.path.split(path)
+    return directory or ".", name
+
+
+def open_dir(directory):
+    """A descriptor for the directory a note lives in.
+
+    Deliberately *not* O_NOFOLLOW: a vault that is itself a symlink is a
+    normal thing to have, and the user chose that one. The protection belongs
+    on the final component, which is the part a scan discovered rather than
+    the part the user configured.
+    """
+    return os.open(directory, os.O_RDONLY | os.O_DIRECTORY | O_CLOEXEC)
+
+
+def open_note(dirfd, name):
+    """Open a note for reading and return (fd, stat), or raise.
+
+    O_NOFOLLOW so a symlink dropped into the vault cannot redirect the open.
+    O_NONBLOCK so a FIFO or device returns immediately instead of parking the
+    helper. The fstat is on the descriptor, so what gets measured is exactly
+    what got opened -- there is no second lookup for anything to race.
+    """
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | O_CLOEXEC, dir_fd=dirfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise NotANote(errno.EINVAL, "not a regular file", name)
+        if st.st_size > MAX_NOTE_BYTES:
+            raise NotANote(errno.EFBIG, "larger than a note should be", name)
+        # Safe to clear now that the descriptor is known to be a regular file:
+        # the flag was only ever there to survive the open itself.
+        os.set_blocking(fd, True)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, st
+
+
+def read_note(dirfd, name):
+    """Return (text, stat) for a note. Raises rather than guessing."""
+    fd, st = open_note(dirfd, name)
+    try:
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, READ_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            # The size was checked before the read, but a file can grow during
+            # one. The cap is enforced against what actually arrives.
+            if total > MAX_NOTE_BYTES:
+                raise NotANote(errno.EFBIG, "grew past a note's size while reading", name)
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8"), st
+
+
+def write_note(directory, dirfd, name, text, expect=None):
+    """Replace a note's contents atomically.
+
+    The new text goes to a temporary file in the same directory -- same
+    directory so the rename is a rename and not a copy across filesystems --
+    which mkstemp creates O_EXCL under a name nothing else holds. It is
+    flushed and fsynced before the rename, so an interrupted edit leaves the
+    old note intact rather than a truncated one, and the rename is what makes
+    the new text visible: a reader sees one version or the other, never a
+    half-written file.
+
+    `expect` is the stat from the read that produced this text. The target is
+    re-opened and re-checked against it immediately before the replace, so an
+    edit computed against one file cannot land on another that took its place.
+    """
+    fd, st = open_note(dirfd, name) if expect is not None else (None, None)
+    try:
+        if expect is not None:
+            if (st.st_dev, st.st_ino) != (expect.st_dev, expect.st_ino):
+                raise NotANote(errno.ESTALE, "replaced underneath the edit", name)
+            mode = stat.S_IMODE(st.st_mode)
+        else:
+            mode = 0o666 & ~current_umask()
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".obsidian-tasks-", suffix=".tmp")
+    try:
+        # mkstemp opens 0600. A note keeps the permissions it already had, so
+        # an edit is not also a quiet permission change.
+        os.fchmod(tmp_fd, mode)
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            tmp_fd = None
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, name, dst_dir_fd=dirfd)
+        tmp_path = None
+    finally:
+        if tmp_fd is not None:
+            os.close(tmp_fd)
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    # The rename itself needs flushing, or a crash can leave the directory
+    # pointing at neither version.
+    try:
+        os.fsync(dirfd)
+    except OSError:
+        pass
+
+
+def current_umask():
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def is_plain_file(path):
+    """True when `path` is a regular file and not a symlink to one."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+# ----------------------------------------------------------------- primitives
+
+def split_body(body):
+    """Split a task body into (description, metadata).
+
+    The description runs up to the first signifier; everything from there on is
+    metadata that edits must preserve verbatim.
+    """
+    cut = len(body)
+    for glyph in SIGNIFIERS:
+        found = body.find(glyph)
+        if found != -1:
+            cut = min(cut, found)
+    return body[:cut].strip(), body[cut:].strip()
+
+
+def rewrite(path, exact, transform):
+    """Apply `transform(status, description, metadata)` to the line matching
+    `exact`, which must return the replacement (status, description, metadata).
+
+    No match means the vault moved under us: a no-op rather than a guess at
+    which line was meant. Returns 0 when a line was rewritten.
+    """
+    directory, name = split_target(path)
+    try:
+        dirfd = open_dir(directory)
+    except OSError:
+        return 1
+    try:
+        try:
+            text, st = read_note(dirfd, name)
+        except (OSError, UnicodeDecodeError):
+            return 1
+        lines = text.split("\n")
+        for index, line in enumerate(lines):
+            if line != exact:
+                continue
+            match = TASK_RE.match(line)
+            if not match:
+                return 1
+            description, metadata = split_body(match.group("body"))
+            result = transform(match.group("status"), description, metadata)
+            if result is None:
+                return 1
+            status, description, metadata = result
+            body = " ".join(part for part in (description, metadata) if part)
+            lines[index] = f'{match.group("indent")}{match.group("bullet")} [{status}] {body}'.rstrip()
+            try:
+                write_note(directory, dirfd, name, "\n".join(lines), expect=st)
+            except OSError:
+                return 1
+            # Echoed so the caller can address the line it just created — undo
+            # needs the completed text, which is no longer the text it clicked.
+            print(lines[index])
+            return 0
+        return 1
+    finally:
+        os.close(dirfd)
+
+
+def strip_signifier(metadata, glyph, dated=True):
+    pattern = re.escape(glyph) + (r"\s*" + DATE_RE + r"?" if dated else "")
+    return " ".join(re.sub(pattern, "", metadata).split())
+
+
+# ------------------------------------------------------------- vault discovery
+
+# Obsidian keeps its own registry of the vaults you have opened. Reading it is
+# not a search of your filesystem: it is one config file, written by Obsidian,
+# naming exactly the folders you already told it about.
+OBSIDIAN_CONFIGS = [
+    "~/.config/obsidian/obsidian.json",
+    "~/.var/app/md.obsidian.Obsidian/config/obsidian.json",
+    "~/snap/obsidian/current/.config/obsidian/obsidian.json",
+]
+
+
+def obsidian_vault():
+    """The vault Obsidian currently has open, else its most recently used."""
+    for candidate in OBSIDIAN_CONFIGS:
+        path = os.path.expanduser(candidate)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as handle:
+                vaults = json.load(handle).get("vaults", {})
+        except (OSError, ValueError):
+            continue
+        entries = [v for v in vaults.values() if isinstance(v, dict) and v.get("path")]
+        if not entries:
+            continue
+        entries.sort(key=lambda v: (bool(v.get("open")), v.get("ts", 0)), reverse=True)
+        for entry in entries:
+            if os.path.isdir(entry["path"]):
+                return entry["path"]
+    return ""
+
+
+def resolve_vault(hint):
+    """Where to look for tasks, and how we decided.
+
+    An explicit setting always wins, even when it points nowhere — a typo should
+    surface as a missing vault, not be silently overridden by a lucky guess.
+    """
+    hint = os.path.expanduser(hint or "").rstrip("/")
+    if hint:
+        return {"path": hint, "source": "config", "exists": os.path.isdir(hint)}
+    found = obsidian_vault()
+    if found:
+        return {"path": found, "source": "obsidian", "exists": True}
+    return {"path": "", "source": "none", "exists": False}
+
+
+# ------------------------------------------------------------------- commands
+
+def scan(vault):
+    args = ["rg", "--no-heading", "--with-filename", "--line-number", "--no-messages",
+            "-e", r"^\s*[-*+] \[.\] "]
+    for glob in EXCLUDES:
+        args += ["-g", glob]
+    args.append(vault)
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    tasks = []
+    # Whether a path is a plain file is asked once per file, not once per task.
+    plain = {}
+    for entry in out.splitlines():
+        path, _, rest = entry.partition(":")
+        lineno, _, raw = rest.partition(":")
+        match = TASK_RE.match(raw)
+        if not match:
+            continue
+        # A row the widget draws is a row the user can click, and a click is an
+        # edit. Anything that is not a plain file never becomes a row, so the
+        # refusal happens here rather than under someone's cursor.
+        if path not in plain:
+            plain[path] = is_plain_file(path)
+        if not plain[path]:
+            continue
+        body, status = match.group("body"), match.group("status")
+        description, metadata = split_body(body)
+        due = re.search(re.escape(DUE) + r"\s*" + DATE_RE, metadata)
+        tasks.append({
+            "file": path,
+            "line": int(lineno) if lineno.isdigit() else 0,
+            "raw": raw,
+            "label": description,
+            "due": due.group(1) if due else "",
+            "priority": next((rank for glyph, rank in PRIORITY.items() if glyph in metadata), 3),
+            "open": status == " ",
+            "vaultPath": os.path.relpath(path, vault),
+        })
+    return tasks
+
+
+def complete(path, exact):
+    def transform(status, description, metadata):
+        if status != " ":
+            return None
+        if DONE not in metadata:
+            metadata = f"{metadata} {DONE} {date.today().isoformat()}".strip()
+        return "x", description, metadata
+    return rewrite(path, exact, transform)
+
+
+def uncomplete(path, exact):
+    def transform(status, description, metadata):
+        if status == " ":
+            return None
+        return " ", description, strip_signifier(metadata, DONE)
+    return rewrite(path, exact, transform)
+
+
+def rename(path, exact, text):
+    text = " ".join(text.split())
+    if not text:
+        return 1
+
+    def transform(status, description, metadata):
+        # A rename that reintroduces a date phrase should move the due date too,
+        # so editing text behaves the same as typing it in the add box.
+        body, due = extract_due(text)
+        if not body:
+            return None
+        if due:
+            metadata = f"{strip_signifier(metadata, DUE)} {DUE} {due}".strip()
+        return status, body, metadata
+    return rewrite(path, exact, transform)
+
+
+def extract_due(text):
+    """Pull a trailing date phrase off a task description.
+
+    Only trailing phrases count. "call bank friday" sets a date; "friday night
+    drinks" keeps its words, because stripping mid-sentence would quietly
+    rewrite what the task says.
+    """
+    today = date.today()
+    patterns = [
+        (r"\s+(\d{4}-\d{2}-\d{2})$", lambda m: m.group(1)),
+        (r"\s+today$", lambda m: today.isoformat()),
+        (r"\s+(?:tomorrow|tmrw)$", lambda m: (today + timedelta(days=1)).isoformat()),
+        (r"\s+next\s+week$", lambda m: (today + timedelta(days=7)).isoformat()),
+        (r"\s+in\s+(\d+)\s+days?$", lambda m: (today + timedelta(days=int(m.group(1)))).isoformat()),
+        (r"\s+in\s+(\d+)\s+weeks?$", lambda m: (today + timedelta(weeks=int(m.group(1)))).isoformat()),
+        # Full names stand alone; the short forms need an explicit "on" or
+        # "next". Bare "sun", "sat" and "mon" are ordinary words, and matching
+        # them ate the last word of tasks like "photograph the sun".
+        (r"\s+(?:on\s+|next\s+)?(" + "|".join(WEEKDAYS) + r")$",
+         lambda m: weekday_ahead(m.group(1))),
+        (r"\s+(?:on|next)\s+(mon|tues?|weds?|thurs?|fri|sat|sun)$",
+         lambda m: weekday_ahead(m.group(1))),
+    ]
+    for pattern, resolve in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return text[:match.start()].strip(), resolve(match)
+    return text.strip(), ""
+
+
+def weekday_ahead(prefix):
+    today = date.today()
+    stem = prefix.lower()[:3]
+    target = next(i for i, name in enumerate(WEEKDAYS) if name.startswith(stem))
+    ahead = (target - today.weekday()) % 7
+    # Naming today's weekday means the next one, not zero days away.
+    return (today + timedelta(days=ahead or 7)).isoformat()
+
+
+def add(path, text):
+    text, due = extract_due(" ".join(text.split()))
+    if not text:
+        return 1
+    parent = os.path.dirname(path)
+    # The caller is expected to have a real vault; if it doesn't, refuse rather
+    # than conjuring a directory tree somewhere nobody asked for.
+    if not parent or not os.path.isdir(os.path.dirname(parent) or "/"):
+        return 1
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError:
+        return 1
+    directory, name = split_target(path)
+    try:
+        dirfd = open_dir(directory)
+    except OSError:
+        return 1
+    try:
+        # An existing note is read through the same checks as any other, so a
+        # symlink or FIFO sitting at the quick-add path is refused rather than
+        # written through. Nothing there yet is the ordinary first-run case.
+        existing, st = "", None
+        try:
+            existing, st = read_note(dirfd, name)
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeDecodeError):
+            return 1
+        # Trailing blank lines and stray spaces upset some readers of this
+        # format, and TaskForge leaves its file without a final newline, so
+        # appending blind would weld the new task onto the last one. Trim the
+        # tail, then rewrite: the task lands directly under the previous one,
+        # every time.
+        trailer = f" {DUE} {due}" if due else ""
+        line = f"- [ ] {text} {CREATED} {date.today().isoformat()}{trailer}".rstrip()
+        body = existing.rstrip()
+        try:
+            write_note(directory, dirfd, name,
+                       (body + "\n" if body else "") + line + "\n", expect=st)
+        except OSError:
+            return 1
+        return 0
+    finally:
+        os.close(dirfd)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: omarchy-tasks vault [hint] | scan <vault> "
+              "| complete|uncomplete <file> <line> | rename <file> <line> <text> "
+              "| add <file> <text>", file=sys.stderr)
+        return 2
+    action, args = sys.argv[1], sys.argv[2:]
+    if action == "vault":
+        json.dump(resolve_vault(args[0] if args else ""), sys.stdout)
+        return 0
+    if action == "scan":
+        json.dump(scan(args[0]) if os.path.isdir(args[0]) else [], sys.stdout)
+        return 0
+    if action == "complete" and len(args) >= 2:
+        return complete(args[0], args[1])
+    if action == "uncomplete" and len(args) >= 2:
+        return uncomplete(args[0], args[1])
+    if action == "rename" and len(args) >= 3:
+        return rename(args[0], args[1], " ".join(args[2:]))
+    if action == "add" and len(args) >= 2:
+        return add(args[0], " ".join(args[1:]))
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

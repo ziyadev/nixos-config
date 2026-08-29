@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# DDC/CI input source switcher. Writes are restricted to VCP feature 0x60 and
+# the three standard source values exposed by the visual settings panel.
+readonly plugin_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plugins/propsuite.dell-input"
+readonly config_file="$state_dir/settings.conf"
+readonly binding_file="$HOME/.config/hypr/propsuite-dell-input.lua"
+readonly lock_file="${XDG_RUNTIME_DIR:-/tmp}/propsuite-ddc-input.lock"
+
+# The bar poller and popup can refresh at the same time. ddcutil uses an
+# exclusive device lock, so serialize complete helper invocations instead of
+# allowing discovery and getvcp to race each other.
+exec 9>"$lock_file"
+flock -w 8 9 || { printf 'Monitor control is busy\n' >&2; exit 1; }
+
+source_code() {
+  case "${1,,}" in
+    displayport|dp|0f) printf '%s\n' "0f" ;;
+    hdmi-1|h1|11) printf '%s\n' "11" ;;
+    hdmi-2|h2|12) printf '%s\n' "12" ;;
+    *) return 2 ;;
+  esac
+}
+
+load_config() {
+  display_id="auto"
+  source_a="11"
+  source_b="12"
+  hotkey="Disabled"
+  if [[ -f $config_file ]]; then
+    # The file is written only by configure() after strict validation.
+    source "$config_file"
+  fi
+}
+
+detect_display() {
+  load_config
+  if [[ $display_id =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "$display_id"
+    return
+  fi
+  ddcutil detect --brief 2>/dev/null | sed -nE 's/^Display ([1-9][0-9]*)$/\1/p' | head -n 1
+}
+
+display_args() {
+  local selected
+  selected="$(detect_display)"
+  [[ $selected =~ ^[1-9][0-9]*$ ]] || { printf 'No DDC/CI display detected\n' >&2; return 1; }
+  printf '%s\n' "$selected"
+}
+
+list_displays() {
+  ddcutil detect --brief 2>/dev/null | awk '
+    /^Display [0-9]+$/ { id=$2; next }
+    /^[[:space:]]*Monitor:/ && id != "" {
+      sub(/^[[:space:]]*Monitor:[[:space:]]*/, "")
+      print id "\t" $0
+      id=""
+    }
+  '
+}
+
+read_input() {
+  local selected
+  selected="$(display_args)"
+  ddcutil --display "$selected" getvcp 60 --brief 2>/dev/null \
+    | sed -nE 's/^VCP 60 .* x([[:xdigit:]]{2})$/\1/p' \
+    | tail -n 1 \
+    | tr '[:upper:]' '[:lower:]'
+}
+
+input_name() {
+  case "$1" in
+    0f) printf '%s\n' "DisplayPort" ;;
+    11) printf '%s\n' "HDMI-1" ;;
+    12) printf '%s\n' "HDMI-2" ;;
+  esac
+}
+
+set_input() {
+  local code
+  code="$(source_code "${1:-}")" || {
+    printf 'Unsupported input: %s\n' "${1:-}" >&2
+    return 2
+  }
+  case "$code" in
+    0f|11|12) ;;
+    *) printf 'Unsupported input code: %s\n' "$code" >&2; return 2 ;;
+  esac
+
+  local selected
+  selected="$(display_args)"
+  ddcutil --display "$selected" setvcp 60 "0x$code"
+  omarchy-notification-send "Dell input: $(input_name "$code")" -t 2000 >/dev/null 2>&1 || true
+}
+
+toggle_input() {
+  local current next
+  load_config
+  current="$(read_input)"
+  if [[ $current == "$source_a" ]]; then next="$source_b"; else next="$source_a"; fi
+  set_input "$next"
+}
+
+configure() {
+  local requested_display="${1:-}" requested_a="${2:-}" requested_b="${3:-}" requested_hotkey="${4:-}"
+  local code_a code_b tmp
+  [[ $requested_display == auto || $requested_display =~ ^[1-9][0-9]*$ ]] || {
+    printf 'Invalid display selection\n' >&2
+    return 2
+  }
+  code_a="$(source_code "$requested_a")" || { printf 'Invalid Source A\n' >&2; return 2; }
+  code_b="$(source_code "$requested_b")" || { printf 'Invalid Source B\n' >&2; return 2; }
+  [[ $code_a != "$code_b" ]] || { printf 'Source A and Source B must differ\n' >&2; return 2; }
+
+  case "$requested_hotkey" in
+    "SUPER + SHIFT + I"|"SUPER + ALT + I"|"CTRL + ALT + I"|Disabled) ;;
+    *) printf 'Unsupported hotkey preset\n' >&2; return 2 ;;
+  esac
+
+  mkdir -p "$state_dir"
+  tmp="$(mktemp "$state_dir/settings.conf.XXXXXX")"
+  printf 'display_id=%q\nsource_a=%q\nsource_b=%q\nhotkey=%q\n' \
+    "$requested_display" "$code_a" "$code_b" "$requested_hotkey" >"$tmp"
+  mv "$tmp" "$config_file"
+
+  # A fresh install with hotkeys disabled must not create or overwrite any
+  # Hyprland configuration. Once the user explicitly selects a hotkey (or
+  # disables one they previously enabled), this plugin-owned file is updated.
+  if [[ $requested_hotkey == "Disabled" && ! -f $binding_file ]]; then
+    return
+  fi
+
+  tmp="$(mktemp "$HOME/.config/hypr/propsuite-dell-input.lua.XXXXXX")"
+  if [[ $requested_hotkey == "Disabled" ]]; then
+    printf '%s\n' '-- Dell Input Switcher hotkey disabled in plugin settings.' >"$tmp"
+  else
+    printf 'o.bind("%s", "%s", "%s")\n' \
+      "$requested_hotkey" \
+      "Toggle Dell monitor input" \
+      "$plugin_dir/ddc-input toggle" >"$tmp"
+  fi
+  mv "$tmp" "$binding_file"
+  hyprctl reload >/dev/null 2>&1 || true
+}
+
+case "${1:-}" in
+  get) read_input ;;
+  displays) list_displays ;;
+  toggle|next) toggle_input ;;
+  set) set_input "${2:-}" ;;
+  configure) configure "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+  *) printf 'Usage: %s <get|displays|toggle|set INPUT|configure DISPLAY A B HOTKEY>\n' "$0" >&2; exit 2 ;;
+esac

@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "id": "m1kode.obsidian-tasks",
+  "name": "Obsidian Tasks",
+  "version": "1.0.1",
+  "author": "Mike Jarrett",
+  "license": "MIT",
+  "description": "Obsidian Tasks checkboxes from a local vault, in the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Obsidian Tasks",
+    "description": "Counts open Obsidian Tasks checkboxes across a vault and lists them in a popup, with click-to-complete and quick add. Reads plain markdown, so anything that syncs the vault keeps it current.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "vaultPath": "",
+      "inboxFile": "Inbox.md",
+      "countMode": "all",
+      "refreshIntervalSec": 60
+    },
+    "schema": [
+      {
+        "key": "vaultPath",
+        "type": "string",
+        "label": "Vault path",
+        "defaultValue": "",
+        "description": "Folder scanned for markdown checkboxes. Left empty, the vault Obsidian currently has open is used. .obsidian, .trash, .git and Templates are always skipped."
+      },
+      {
+        "key": "inboxFile",
+        "type": "string",
+        "label": "Quick-add file",
+        "defaultValue": "Inbox.md",
+        "description": "Where the add box appends new tasks, relative to the vault. Created on first use; a path with folders in it, like Tasks/Inbox.md, creates them. Only affects new tasks — existing ones are found anywhere in the vault."
+      },
+      {
+        "key": "countMode",
+        "type": "enum",
+        "label": "Bar icon lights up for",
+        "options": [
+          "all",
+          "due"
+        ],
+        "defaultValue": "all",
+        "description": "all keeps the icon lit whenever anything is open; due lights it only for tasks dated today or earlier, so the widget goes quiet when nothing is pressing."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Rescan interval (seconds)",
+        "min": 10,
+        "max": 900,
+        "step": 10,
+        "defaultValue": 60,
+        "description": "How often the vault is rescanned. The popup also rescans every time it opens."
+      }
+    ]
+  }
+}

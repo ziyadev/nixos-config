@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "id": "propsuite.dell-input",
+  "name": "DDC Input Switcher",
+  "version": "3.1.0",
+  "author": "PropSuite",
+  "license": "MIT",
+  "description": "Visually configure and toggle monitor input sources using DDC/CI.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Monitor input",
+    "description": "Open a visual panel to configure and toggle monitor input sources.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "displayId": "auto",
+      "sourceA": "HDMI-1",
+      "sourceB": "HDMI-2",
+      "hotkey": "Disabled"
+    },
+    "schema": [
+      {
+        "key": "displayId",
+        "type": "string",
+        "label": "DDC display",
+        "description": "Display number from ddcutil, or auto for the first detected display.",
+        "defaultValue": "auto"
+      },
+      {
+        "key": "sourceA",
+        "type": "enum",
+        "label": "Source A",
+        "description": "First monitor input in the toggle pair.",
+        "options": ["HDMI-1", "HDMI-2", "DisplayPort"],
+        "defaultValue": "HDMI-1"
+      },
+      {
+        "key": "sourceB",
+        "type": "enum",
+        "label": "Source B",
+        "description": "Second monitor input in the toggle pair.",
+        "options": ["HDMI-1", "HDMI-2", "DisplayPort"],
+        "defaultValue": "HDMI-2"
+      },
+      {
+        "key": "hotkey",
+        "type": "enum",
+        "label": "Toggle hotkey",
+        "description": "Global shortcut used to toggle the configured source pair.",
+        "options": [
+          "SUPER + SHIFT + I",
+          "SUPER + ALT + I",
+          "CTRL + ALT + I",
+          "Disabled"
+        ],
+        "defaultValue": "Disabled"
+      }
+    ]
+  }
+}

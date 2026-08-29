@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "idle": {
+    "screensaver": 150,
+    "lock": 300
+  },
+  "bar": {
+    "position": "top",
+    "transparent": false,
+    "centerAnchor": "omarchy.clock",
+    "layout": {
+      "left": [
+        {
+          "id": "omarchy.menu"
+        },
+        {
+          "id": "io.github.maxart.simple-workspaces"
+        }
+      ],
+      "center": [
+        {
+          "id": "omarchy.indicators"
+        },
+        {
+          "id": "omarchy.weather"
+        },
+        {
+          "id": "omarchy.clock",
+          "format": "dddd HH:mm",
+          "formatAlt": "d MMMM 'W'ww yyyy",
+          "verticalFormat": "HH\n—\nmm"
+        },
+        {
+          "id": "omarchy.keyboard-layout"
+        },
+        {
+          "id": "omarchy.agents"
+        },
+        {
+          "id": "m1kode.obsidian-tasks",
+          "vaultPath": "/home/ziyadev/Work/obsidian-vault/Todos"
+        },
+        {
+          "id": "omarchy.system-update"
+        },
+        {
+          "id": "propsuite.dell-input"
+        }
+      ],
+      "right": [
+        {
+          "id": "omarchy.tray"
+        },
+        {
+          "id": "novuon.tableau"
+        },
+        {
+          "id": "omarchy.bluetooth"
+        },
+        {
+          "id": "omarchy.network"
+        },
+        {
+          "id": "omarchy.audio"
+        },
+        {
+          "id": "omarchy.monitor"
+        },
+        {
+          "id": "omarchy.power"
+        }
+      ]
+    }
+  },
+  "plugins": []
+}
