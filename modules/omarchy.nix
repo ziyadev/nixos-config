@@ -143,7 +143,8 @@ in
   i18n.inputMethod = {
     enable = true;
     type = "fcitx5";
-    fcitx5.addons = with pkgs; [ fcitx5-gtk fcitx5-qt ];
+    # fcitx5-qt lives under qt6Packages, not as a top-level package.
+    fcitx5.addons = with pkgs; [ fcitx5-gtk qt6Packages.fcitx5-qt ];
   };
 
   security.rtkit.enable = true;
@@ -263,10 +264,9 @@ in
     libreoffice-fresh
     localsend
     moonlight-qt
-    mpv
-    # mpv-mpris is an mpv *script*, not a standalone binary — wire it via
-    # home-manager's `programs.mpv.scripts = [ pkgs.mpvScripts.mpris ];`
-    # instead of dropping it in systemPackages, where mpv won't load it.
+    # mpv itself, and mpv-mpris (an mpv *script*, not a standalone binary),
+    # are wired per-user via home-manager's `programs.mpv` in home.nix —
+    # dropping the script package here wouldn't make mpv load it.
     nautilus
     nautilus-python
     obs-studio
